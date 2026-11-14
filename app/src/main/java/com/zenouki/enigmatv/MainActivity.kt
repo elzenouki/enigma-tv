@@ -24,13 +24,18 @@ import android.widget.AdapterView
 import android.widget.BaseAdapter
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.annotation.OptIn
+import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -57,10 +62,13 @@ class MainActivity : Activity() {
         val name: String,
         var now: String = "",
         var begin: Long = 0L,
-        var duration: Long = 0L
+        var duration: Long = 0L,
+        val picon: String? = null,
+        var next: String = "",
+        var nextBegin: Long = 0L
     )
 
-    data class Row(val num: String, val title: String, val sub: String)
+    data class Row(val num: String, val title: String, val sub: String, val picon: String? = null, val showPicon: Boolean = false)
 
     private lateinit var prefs: SharedPreferences
     private var player: ExoPlayer? = null
@@ -73,6 +81,12 @@ class MainActivity : Activity() {
     private lateinit var bNow: TextView
     private lateinit var bProgress: ProgressBar
     private lateinit var bBouquet: TextView
+    private lateinit var bPicon: ImageView
+    private lateinit var bNext: TextView
+    private lateinit var bClock: TextView
+    private lateinit var bTech: TextView
+    private val sleepRunnable = Runnable { goToSleep() }
+    private var sleepAt = 0L
     private lateinit var panel: View
     private lateinit var bouquetList: ListView
     private lateinit var channelList: ListView
@@ -137,6 +151,11 @@ class MainActivity : Activity() {
         bNow = findViewById(R.id.bNow)
         bProgress = findViewById(R.id.bProgress)
         bBouquet = findViewById(R.id.bBouquet)
+        bPicon = findViewById(R.id.bPicon)
+        bNext = findViewById(R.id.bNext)
+        bClock = findViewById(R.id.bClock)
+        bTech = findViewById(R.id.bTech)
+        playerView.resizeMode = RESIZE_MODES[prefs.getInt("resize", 0).coerceIn(0, RESIZE_MODES.size - 1)]
         panel = findViewById(R.id.panel)
         bouquetList = findViewById(R.id.bouquetList)
         channelList = findViewById(R.id.channelList)
@@ -226,6 +245,10 @@ class MainActivity : Activity() {
                 }
             }
 
+            override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
+                if (banner.visibility == View.VISIBLE) updateTech()
+            }
+
             override fun onPlaybackStateChanged(state: Int) {
                 if (state == Player.STATE_READY) {
                     status.visibility = View.GONE
@@ -233,6 +256,8 @@ class MainActivity : Activity() {
                 }
             }
         })
+        applyTrackPrefs(p)
+        Picons.auth = authHeader()
         playerView.player = p
         player = p
     }
@@ -256,6 +281,7 @@ class MainActivity : Activity() {
         ui.removeCallbacks(pendingPlay)
         ui.removeCallbacks(retryRunnable)
         retried = false
+        clearTrackOverrides()
         if (immediate) startStream() else ui.postDelayed(pendingPlay, 450)
     }
 
@@ -389,7 +415,7 @@ class MainActivity : Activity() {
     }
 
     private fun fetchChannels(bouquetRef: String): List<Channel> {
-        val json = JSONObject(httpGet("/api/getservices?sRef=" + enc(bouquetRef)))
+        val json = JSONObject(httpGet("/api/getservices?picon=1&sRef=" + enc(bouquetRef)))
         val arr = json.optJSONArray("services") ?: return emptyList()
         val out = ArrayList<Channel>()
         for (i in 0 until arr.length()) {
@@ -397,7 +423,13 @@ class MainActivity : Activity() {
             val ref = o.optString("servicereference")
             val name = o.optString("servicename")
             if (ref.isBlank() || isMarker(ref) || name.isBlank()) continue
-            out.add(Channel(ref, name))
+            val pic = o.optString("picon", "")
+            val picUrl = when {
+                pic.isBlank() -> null
+                pic.startsWith("http") -> pic
+                else -> "http://${host()}" + (if (pic.startsWith("/")) pic else "/$pic")
+            }
+            out.add(Channel(ref, name, picon = picUrl))
         }
         return out
     }
@@ -446,7 +478,7 @@ class MainActivity : Activity() {
                     return@post
                 }
                 browseChannels = chs
-                channelAdapter.rows = chs.mapIndexed { i, c -> Row("${i + 1}", c.name, c.now) }
+                channelAdapter.rows = chs.mapIndexed { i, c -> Row("${i + 1}", c.name, c.now, c.picon, true) }
                 if (chs.isEmpty()) channelAdapter.rows = listOf(Row("", "الباقة فاضية", ""))
                 val sel = if (selectRef != null) chs.indexOfFirst { it.ref == selectRef } else -1
                 val active = if (playBouquet?.ref == bq.ref) playIndex else -1
@@ -511,9 +543,32 @@ class MainActivity : Activity() {
         banner.visibility = View.VISIBLE
         ui.removeCallbacks(hideBanner)
         ui.postDelayed(hideBanner, 5000)
-        val ch = playChannels[playIndex]
-        val nowSec = System.currentTimeMillis() / 1000
-        if (ch.begin == 0L || ch.begin + ch.duration < nowSec) refreshPlayingEpg()
+        fetchNowNext(playChannels[playIndex])
+    }
+
+    private fun fetchNowNext(ch: Channel) {
+        io.execute {
+            try {
+                val arr = JSONObject(httpGet("/api/epgservicenownext?sRef=" + enc(ch.ref))).optJSONArray("events")
+                if (arr != null && arr.length() > 0) {
+                    val now = arr.getJSONObject(0)
+                    if (now.optLong("begin_timestamp", 0L) > 0) {
+                        ch.now = now.optString("title", "")
+                        ch.begin = now.optLong("begin_timestamp", 0L)
+                        ch.duration = now.optLong("duration_sec", 0L)
+                    }
+                    if (arr.length() > 1) {
+                        val nx = arr.getJSONObject(1)
+                        ch.next = nx.optString("title", "")
+                        ch.nextBegin = nx.optLong("begin_timestamp", 0L)
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            ui.post {
+                if (banner.visibility == View.VISIBLE && playIndex in playChannels.indices && playChannels[playIndex] === ch) updateBannerText()
+            }
+        }
     }
 
     private fun updateBannerText() {
@@ -522,6 +577,12 @@ class MainActivity : Activity() {
         bNum.text = "${playIndex + 1}"
         bName.text = ch.name
         bBouquet.text = playBouquet?.name ?: ""
+        Picons.load(ch.picon, bPicon)
+        val hm = SimpleDateFormat("HH:mm", Locale.US)
+        bClock.text = hm.format(Date())
+        bNext.text = if (ch.next.isNotBlank() && ch.nextBegin > 0) "بعده  ${hm.format(Date(ch.nextBegin * 1000))}   ${ch.next}" else ""
+        bNext.visibility = if (bNext.text.isEmpty()) View.GONE else View.VISIBLE
+        updateTech()
         if (ch.now.isNotBlank() && ch.begin > 0) {
             val fmt = SimpleDateFormat("HH:mm", Locale.US)
             val from = fmt.format(Date(ch.begin * 1000))
@@ -563,6 +624,204 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------------------------------------------------------------- options (audio / subs / picture / sleep)
+
+    private fun showOptions() {
+        hidePanel()
+        val labels = arrayOf(
+            "🔊  الصوت:  " + currentTrackLabel(C.TRACK_TYPE_AUDIO),
+            "💬  الترجمة:  " + currentTrackLabel(C.TRACK_TYPE_TEXT),
+            "🖼  مقاس الصورة:  " + RESIZE_NAMES[prefs.getInt("resize", 0).coerceIn(0, RESIZE_NAMES.size - 1)],
+            "⏰  مؤقت النوم:  " + sleepLabel(),
+            "⚙  إعدادات الرسيفر"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("خيارات")
+            .setItems(labels) { _, which ->
+                when (which) {
+                    0 -> chooseTrack(C.TRACK_TYPE_AUDIO)
+                    1 -> chooseTrack(C.TRACK_TYPE_TEXT)
+                    2 -> cycleResize()
+                    3 -> chooseSleep()
+                    4 -> showSettings()
+                }
+            }
+            .show()
+    }
+
+    private data class TrackOpt(val group: androidx.media3.common.Tracks.Group, val index: Int, val label: String, val lang: String?)
+
+    private fun tracksOf(type: Int): List<TrackOpt> {
+        val p = player ?: return emptyList()
+        val out = ArrayList<TrackOpt>()
+        var n = 0
+        for (g in p.currentTracks.groups) {
+            if (g.type != type) continue
+            for (i in 0 until g.length) {
+                if (!g.isTrackSupported(i)) continue
+                n++
+                val f = g.getTrackFormat(i)
+                out.add(TrackOpt(g, i, trackLabel(f, n, type), f.language))
+            }
+        }
+        return out
+    }
+
+    private fun currentTrackLabel(type: Int): String {
+        val p = player ?: return "-"
+        if (type == C.TRACK_TYPE_TEXT && p.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)) return "مقفولة"
+        var n = 0
+        for (g in p.currentTracks.groups) {
+            if (g.type != type) continue
+            for (i in 0 until g.length) {
+                if (!g.isTrackSupported(i)) continue
+                n++
+                if (g.isTrackSelected(i)) return trackLabel(g.getTrackFormat(i), n, type)
+            }
+        }
+        return if (type == C.TRACK_TYPE_TEXT) "مقفولة" else "-"
+    }
+
+    private fun trackLabel(f: Format, n: Int, type: Int): String {
+        val lang = langName(f.language)
+        val base = when {
+            !f.label.isNullOrBlank() && lang != null -> "${f.label} ($lang)"
+            !f.label.isNullOrBlank() -> f.label!!
+            lang != null -> lang
+            else -> (if (type == C.TRACK_TYPE_AUDIO) "صوت " else "ترجمة ") + n
+        }
+        val mime = f.sampleMimeType ?: ""
+        val codec = when {
+            mime.contains("ac3", true) || mime.contains("eac3", true) -> " • Dolby"
+            mime.contains("aac", true) -> " • AAC"
+            mime.contains("dvbsubs", true) -> " • DVB"
+            else -> ""
+        }
+        return base + codec
+    }
+
+    private fun langName(code: String?): String? {
+        if (code.isNullOrBlank() || code == "und") return null
+        return when (code.lowercase(Locale.US).take(3)) {
+            "ar", "ara" -> "عربي"
+            "en", "eng" -> "إنجليزي"
+            "fr", "fre", "fra" -> "فرنساوي"
+            "de", "ger", "deu" -> "ألماني"
+            "tr", "tur" -> "تركي"
+            "es", "spa" -> "إسباني"
+            "it", "ita" -> "إيطالي"
+            "fa", "per", "fas" -> "فارسي"
+            "hi", "hin" -> "هندي"
+            "ur", "urd" -> "أوردو"
+            "qaa", "mul" -> "أصلي"
+            else -> code
+        }
+    }
+
+    private fun chooseTrack(type: Int) {
+        val p = player ?: return
+        val opts = tracksOf(type)
+        if (opts.isEmpty()) {
+            Toast.makeText(this, if (type == C.TRACK_TYPE_AUDIO) "مفيش أصوات تانية للقناة دي" else "مفيش ترجمة للقناة دي", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val items = ArrayList<String>()
+        if (type == C.TRACK_TYPE_TEXT) items.add("بدون ترجمة")
+        items.addAll(opts.map { it.label })
+        AlertDialog.Builder(this)
+            .setTitle(if (type == C.TRACK_TYPE_AUDIO) "اختار الصوت" else "اختار الترجمة")
+            .setItems(items.toTypedArray()) { _, which ->
+                val b = p.trackSelectionParameters.buildUpon()
+                if (type == C.TRACK_TYPE_TEXT && which == 0) {
+                    b.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                    prefs.edit().putString("subLang", "off").apply()
+                } else {
+                    val o = opts[if (type == C.TRACK_TYPE_TEXT) which - 1 else which]
+                    b.setTrackTypeDisabled(type, false)
+                    b.setOverrideForType(TrackSelectionOverride(o.group.mediaTrackGroup, o.index))
+                    if (type == C.TRACK_TYPE_AUDIO) {
+                        b.setPreferredAudioLanguage(o.lang)
+                        prefs.edit().putString("audioLang", o.lang ?: "").apply()
+                    } else {
+                        b.setPreferredTextLanguage(o.lang)
+                        prefs.edit().putString("subLang", o.lang ?: "").apply()
+                    }
+                }
+                p.trackSelectionParameters = b.build()
+            }
+            .show()
+    }
+
+    private fun applyTrackPrefs(p: ExoPlayer) {
+        val b = p.trackSelectionParameters.buildUpon()
+        val a = prefs.getString("audioLang", "") ?: ""
+        if (a.isNotBlank()) b.setPreferredAudioLanguage(a)
+        when (val t = prefs.getString("subLang", "off") ?: "off") {
+            "off" -> b.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+            "" -> b.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+            else -> b.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).setPreferredTextLanguage(t)
+        }
+        p.trackSelectionParameters = b.build()
+    }
+
+    /** When the channel changes, drop per-channel overrides but keep language preferences. */
+    private fun clearTrackOverrides() {
+        val p = player ?: return
+        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().clearOverrides().build()
+    }
+
+    private fun updateTech() {
+        val p = player ?: return
+        val f = p.videoFormat
+        val res = when {
+            f == null || f.height <= 0 -> ""
+            f.height >= 2000 -> "4K"
+            f.height >= 1000 -> "FHD"
+            f.height >= 700 -> "HD"
+            else -> "SD"
+        }
+        val audio = currentTrackLabel(C.TRACK_TYPE_AUDIO).let { if (it == "-") "" else it }
+        bTech.text = listOf(res, audio).filter { it.isNotBlank() }.joinToString("  •  ")
+    }
+
+    private fun cycleResize() {
+        val next = (prefs.getInt("resize", 0) + 1) % RESIZE_MODES.size
+        prefs.edit().putInt("resize", next).apply()
+        playerView.resizeMode = RESIZE_MODES[next]
+        Toast.makeText(this, "مقاس الصورة: " + RESIZE_NAMES[next], Toast.LENGTH_SHORT).show()
+    }
+
+    private fun sleepLabel(): String {
+        if (sleepAt == 0L) return "مقفول"
+        val left = ((sleepAt - System.currentTimeMillis()) / 60000).coerceAtLeast(0)
+        return "باقي $left دقيقة"
+    }
+
+    private fun chooseSleep() {
+        val mins = intArrayOf(0, 15, 30, 60, 90, 120)
+        val names = arrayOf("إلغاء المؤقت", "15 دقيقة", "30 دقيقة", "ساعة", "ساعة ونص", "ساعتين")
+        AlertDialog.Builder(this)
+            .setTitle("مؤقت النوم")
+            .setItems(names) { _, w ->
+                ui.removeCallbacks(sleepRunnable)
+                if (mins[w] == 0) {
+                    sleepAt = 0L
+                    Toast.makeText(this, "اتلغى مؤقت النوم", Toast.LENGTH_SHORT).show()
+                } else {
+                    sleepAt = System.currentTimeMillis() + mins[w] * 60_000L
+                    ui.postDelayed(sleepRunnable, mins[w] * 60_000L)
+                    Toast.makeText(this, "التطبيق هيقفل بعد ${names[w]}", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .show()
+    }
+
+    private fun goToSleep() {
+        sleepAt = 0L
+        player?.stop()
+        finish()
+    }
+
     private fun showSettings() {
         val pad = (20 * resources.displayMetrics.density).toInt()
         val box = LinearLayout(this).apply {
@@ -597,6 +856,7 @@ class MainActivity : Activity() {
                     .putBoolean("syncMain", syncF.isChecked)
                     .apply()
                 hidePanel()
+                Picons.clear()
                 releasePlayer()
                 initPlayer()
                 loaded = false
@@ -613,7 +873,7 @@ class MainActivity : Activity() {
         val code = event.keyCode
 
         if (code == KeyEvent.KEYCODE_MENU || code == KeyEvent.KEYCODE_SETTINGS) {
-            showSettings(); return true
+            showOptions(); return true
         }
 
         if (panel.visibility == View.VISIBLE) {
@@ -643,7 +903,8 @@ class MainActivity : Activity() {
                 else showPanel()
                 return true
             }
-            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_INFO -> { showBanner(); return true }
+            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_CAPTIONS, KeyEvent.KEYCODE_MEDIA_AUDIO_TRACK -> { showOptions(); return true }
+            KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_INFO -> { showBanner(); return true }
             KeyEvent.KEYCODE_LAST_CHANNEL -> { return true }
             KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
                 if (banner.visibility == View.VISIBLE) { banner.visibility = View.GONE; return true }
@@ -815,6 +1076,13 @@ class MainActivity : Activity() {
             num.text = r.num
             num.visibility = if (r.num.isEmpty()) View.GONE else View.VISIBLE
             v.findViewById<TextView>(R.id.title).text = r.title
+            val pic = v.findViewById<ImageView>(R.id.picon)
+            if (r.showPicon) {
+                pic.visibility = View.VISIBLE
+                Picons.load(r.picon, pic)
+            } else {
+                pic.visibility = View.GONE
+            }
             val sub = v.findViewById<TextView>(R.id.sub)
             sub.text = r.sub
             sub.visibility = if (r.sub.isEmpty()) View.GONE else View.VISIBLE
@@ -824,6 +1092,12 @@ class MainActivity : Activity() {
 
     companion object {
         const val DEFAULT_HOST = "192.168.1.169"
+        val RESIZE_MODES = intArrayOf(
+            AspectRatioFrameLayout.RESIZE_MODE_FIT,
+            AspectRatioFrameLayout.RESIZE_MODE_ZOOM,
+            AspectRatioFrameLayout.RESIZE_MODE_FILL
+        )
+        val RESIZE_NAMES = arrayOf("عادي", "تكبير (يملا الشاشة)", "مطّ")
         const val RELEASES_API = "https://api.github.com/repos/elzenouki/enigma-tv/releases/latest"
     }
 }
