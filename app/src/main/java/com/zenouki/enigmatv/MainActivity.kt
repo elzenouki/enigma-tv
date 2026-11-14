@@ -3,6 +3,11 @@ package com.zenouki.enigmatv
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.provider.Settings
+import androidx.core.content.FileProvider
+import java.io.File
 import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
@@ -102,6 +107,7 @@ class MainActivity : Activity() {
     private var currentRef: String? = null
     private var lastOwnZap = 0L
     private var started = false
+    private var updateChecked = false
     private val poller = object : Runnable {
         override fun run() {
             ui.removeCallbacks(this)
@@ -175,6 +181,10 @@ class MainActivity : Activity() {
         initPlayer()
         if (!loaded) loadAll() else if (playIndex >= 0) startStream()
         ui.postDelayed(poller, 4000)
+        if (!updateChecked) {
+            updateChecked = true
+            ui.postDelayed({ checkForUpdate() }, 6000)
+        }
     }
 
     override fun onStop() {
@@ -649,6 +659,96 @@ class MainActivity : Activity() {
         return super.dispatchKeyEvent(event)
     }
 
+    // ---------------------------------------------------------------- auto update
+
+    @Suppress("DEPRECATION")
+    private fun myVersionCode(): Int = try {
+        packageManager.getPackageInfo(packageName, 0).versionCode
+    } catch (_: Exception) { 0 }
+
+    private fun checkForUpdate() {
+        io.execute {
+            try {
+                val c = URL(RELEASES_API).openConnection() as HttpURLConnection
+                c.connectTimeout = 8000
+                c.readTimeout = 15000
+                c.setRequestProperty("Accept", "application/vnd.github+json")
+                val body = try { c.inputStream.bufferedReader().use { it.readText() } } finally { c.disconnect() }
+                val json = JSONObject(body)
+                val tag = json.optString("tag_name")
+                val latest = tag.substringAfterLast('.').toIntOrNull() ?: return@execute
+                if (latest <= myVersionCode()) return@execute
+                val assets = json.optJSONArray("assets") ?: return@execute
+                var url: String? = null
+                for (i in 0 until assets.length()) {
+                    val a = assets.getJSONObject(i)
+                    if (a.optString("name").endsWith(".apk")) url = a.optString("browser_download_url")
+                }
+                val apkUrl = url ?: return@execute
+                ui.post { askUpdate(tag, apkUrl) }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun askUpdate(tag: String, apkUrl: String) {
+        if (isFinishing) return
+        AlertDialog.Builder(this)
+            .setTitle("تحديث جديد")
+            .setMessage("فيه نسخة جديدة $tag\nتحب تحدّث دلوقتي؟")
+            .setPositiveButton("تحديث") { _, _ -> downloadAndInstall(apkUrl) }
+            .setNegativeButton("بعدين", null)
+            .show()
+    }
+
+    private fun downloadAndInstall(apkUrl: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+            Toast.makeText(this, "اسمح لـ Enigma TV بتثبيت التطبيقات وبعدين ارجع", Toast.LENGTH_LONG).show()
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+            } catch (_: Exception) {
+                try { startActivity(Intent(Settings.ACTION_SECURITY_SETTINGS)) } catch (_: Exception) {}
+            }
+            updateChecked = false
+            return
+        }
+        showStatus("جاري تحميل التحديث...")
+        io.execute {
+            try {
+                val out = File(cacheDir, "enigma-tv-update.apk")
+                var link = apkUrl
+                var conn: HttpURLConnection
+                var hops = 0
+                while (true) {
+                    conn = URL(link).openConnection() as HttpURLConnection
+                    conn.instanceFollowRedirects = false
+                    conn.connectTimeout = 10000
+                    conn.readTimeout = 30000
+                    val code = conn.responseCode
+                    if (code in 300..399 && hops < 5) {
+                        link = conn.getHeaderField("Location")
+                        conn.disconnect()
+                        hops++
+                        continue
+                    }
+                    break
+                }
+                conn.inputStream.use { input -> out.outputStream().use { input.copyTo(it) } }
+                conn.disconnect()
+                ui.post {
+                    status.visibility = View.GONE
+                    val uri = FileProvider.getUriForFile(this, "$packageName.files", out)
+                    val intent = Intent(Intent.ACTION_VIEW)
+                        .setDataAndType(uri, "application/vnd.android.package-archive")
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(intent)
+                }
+            } catch (e: Exception) {
+                ui.post { showStatus("فشل تحميل التحديث\n${e.message ?: ""}") ; ui.postDelayed({ status.visibility = View.GONE }, 4000) }
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private fun host(): String = (prefs.getString("host", DEFAULT_HOST) ?: DEFAULT_HOST)
@@ -724,5 +824,6 @@ class MainActivity : Activity() {
 
     companion object {
         const val DEFAULT_HOST = "192.168.1.169"
+        const val RELEASES_API = "https://api.github.com/repos/elzenouki/enigma-tv/releases/latest"
     }
 }
