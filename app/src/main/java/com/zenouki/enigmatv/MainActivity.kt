@@ -17,6 +17,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.AdapterView
 import android.widget.BaseAdapter
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ListView
@@ -97,6 +98,19 @@ class MainActivity : Activity() {
     private val pendingPlay = Runnable { startStream() }
     private val retryRunnable = Runnable { startStream() }
 
+    // --- sync with main receiver (single cable) ---
+    private var currentRef: String? = null
+    private var lastOwnZap = 0L
+    private var started = false
+    private val poller = object : Runnable {
+        override fun run() {
+            ui.removeCallbacks(this)
+            if (!started) return
+            if (syncMain() && loaded) checkReceiverChannel()
+            ui.postDelayed(this, 4000)
+        }
+    }
+
     // ---------------------------------------------------------------- lifecycle
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -157,12 +171,16 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        started = true
         initPlayer()
         if (!loaded) loadAll() else if (playIndex >= 0) startStream()
+        ui.postDelayed(poller, 4000)
     }
 
     override fun onStop() {
         super.onStop()
+        started = false
+        ui.removeCallbacks(poller)
         ui.removeCallbacks(pendingPlay)
         ui.removeCallbacks(retryRunnable)
         releasePlayer()
@@ -232,13 +250,79 @@ class MainActivity : Activity() {
     }
 
     private fun startStream() {
-        val p = player ?: return
+        if (player == null) return
         if (playIndex !in playChannels.indices) return
         val ch = playChannels[playIndex]
         status.visibility = View.GONE
-        p.setMediaItem(MediaItem.fromUri(Uri.parse(streamUrl(ch.ref))))
+        currentRef = ch.ref
+        if (syncMain() && !isIptv(ch.ref)) {
+            // single cable: switch the main receiver first, then stream the same service
+            lastOwnZap = System.currentTimeMillis()
+            io.execute {
+                try { httpGet("/api/zap?sRef=" + enc(ch.ref)) } catch (_: Exception) {}
+                ui.postDelayed({ if (currentRef == ch.ref) openStream(ch.ref) }, 600)
+            }
+        } else {
+            openStream(ch.ref)
+        }
+    }
+
+    private fun openStream(ref: String) {
+        val p = player ?: return
+        p.setMediaItem(MediaItem.fromUri(Uri.parse(streamUrl(ref))))
         p.prepare()
         p.playWhenReady = true
+    }
+
+    /** If someone changed the channel with the receiver's own remote, follow it. */
+    private fun checkReceiverChannel() {
+        if (System.currentTimeMillis() - lastOwnZap < 8000) return
+        io.execute {
+            val ref = try {
+                JSONObject(httpGet("/api/statusinfo")).optString("currservice_serviceref", "")
+            } catch (_: Exception) { "" }
+            if (ref.isBlank() || isMarker(ref)) return@execute
+            ui.post { followReceiver(ref) }
+        }
+    }
+
+    private fun followReceiver(ref: String) {
+        if (System.currentTimeMillis() - lastOwnZap < 8000) return
+        val cur = currentRef
+        if (cur != null && norm(ref) == norm(cur)) return
+        val i = playChannels.indexOfFirst { norm(it.ref) == norm(ref) }
+        if (i >= 0) {
+            playIndex = i
+            currentRef = playChannels[i].ref
+            prefs.edit().putString("lastChannel", currentRef).apply()
+            showBanner()
+            openStream(playChannels[i].ref)
+            return
+        }
+        // not in the current bouquet: search the other bouquets
+        currentRef = ref
+        val bqs = bouquets
+        io.execute {
+            for (bq in bqs) {
+                val chs = try { fetchChannels(bq.ref) } catch (_: Exception) { null } ?: continue
+                val idx = chs.indexOfFirst { norm(it.ref) == norm(ref) }
+                if (idx >= 0) {
+                    fillEpg(bq.ref, chs)
+                    ui.post {
+                        if (currentRef == ref) {
+                            playBouquet = bq
+                            playChannels = chs
+                            playIndex = idx
+                            prefs.edit().putString("lastBouquet", bq.ref).putString("lastChannel", ref).apply()
+                            showBanner()
+                            openStream(chs[idx].ref)
+                        }
+                    }
+                    return@execute
+                }
+            }
+            ui.post { if (currentRef == ref) openStream(ref) }
+        }
     }
 
     private fun zap(delta: Int) {
@@ -486,6 +570,11 @@ class MainActivity : Activity() {
         val hostF = field("IP الرسيفر (مثال 192.168.1.169)", host())
         val userF = field("اسم المستخدم (سيبه فاضي لو مفيش)", prefs.getString("user", "") ?: "")
         val passF = field("الباسورد", prefs.getString("pass", "") ?: "", password = true)
+        val syncF = CheckBox(this).apply {
+            text = "تحويل الرسيفر الأساسي مع الشاشة (كابل واحد)"
+            isChecked = syncMain()
+            box.addView(this)
+        }
 
         AlertDialog.Builder(this)
             .setTitle("إعدادات الرسيفر")
@@ -495,6 +584,7 @@ class MainActivity : Activity() {
                     .putString("host", hostF.text.toString().trim().ifBlank { DEFAULT_HOST })
                     .putString("user", userF.text.toString().trim())
                     .putString("pass", passF.text.toString())
+                    .putBoolean("syncMain", syncF.isChecked)
                     .apply()
                 hidePanel()
                 releasePlayer()
@@ -590,6 +680,13 @@ class MainActivity : Activity() {
         }
         val hostOnly = host().substringBefore(':')
         return "http://$hostOnly:8001/$ref"
+    }
+
+    private fun syncMain() = prefs.getBoolean("syncMain", true)
+
+    private fun isIptv(ref: String): Boolean {
+        val parts = ref.split(":")
+        return parts.size > 10 && parts[10].startsWith("http", ignoreCase = true)
     }
 
     private fun isMarker(ref: String): Boolean {
